@@ -29,9 +29,10 @@ from torch.utils.data import DataLoader, Dataset
 
 from . import distributed
 from .data.collate import CollatorConfig, SystemOneCollator
-from .data.format import Example, load_examples, split_examples
+from .data.format import Example, assert_disjoint, group_keys, load_examples, split_examples
 from .data.sampling import LengthGroupedBatchSampler, example_length, padding_fraction
 from .modeling import StrandsDeciderConfig, StrandsDeciderModel
+from .vision import move_model_inputs
 
 
 @dataclass
@@ -43,6 +44,12 @@ class TrainConfig:
 
     # model
     base_model: str = "Qwen/Qwen3-1.7B-Base"
+    input_mode: str = "text"
+    base_revision: str | None = None
+    prompt_format: str | None = None
+    max_images: int | None = None
+    max_visual_tokens_per_image: int | None = None
+    max_total_visual_tokens: int | None = None
     num_slots: int = 24
     head_hidden: int = 0
     head_dropout: float = 0.05
@@ -137,7 +144,7 @@ def _random_batches(n: int, cfg: TrainConfig) -> list[list[int]]:
     order = list(range(n))
     random.Random(cfg.seed).shuffle(order)
     b = cfg.micro_batch_size
-    return [order[i:i + b] for i in range(0, n - n % b, b)]
+    return [order[i : i + b] for i in range(0, n - n % b, b)]
 
 
 class ExampleDataset(Dataset):
@@ -194,16 +201,8 @@ def evaluate_loss(
     for batch in loader:
         if batches >= max_batches:
             break
-        batch = {k: v.to(device) for k, v in batch.items()}
-        out = model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            n_slots=batch["n_slots"],
-            opt_idx=batch.get("opt_idx"),
-            labels=batch["labels"],
-            label_dist=batch.get("label_dist"),
-            weights=batch.get("weights"),
-        )
+        batch = move_model_inputs(batch, device, model.torso)
+        out = model(**model_inputs(batch))
         total_loss += float(out["loss"])
         pred = out["log_probs"].argmax(dim=-1)
         total_correct += int((pred == batch["labels"]).sum())
@@ -221,8 +220,13 @@ def evaluate_loss(
 FROZEN_PASS_TOKENS = 32768
 
 
-def _frozen_reference(model: StrandsDeciderModel, examples: list[Example], batches: list[list[int]],
-                      coll_cfg: CollatorConfig, device: str) -> torch.Tensor:
+def _frozen_reference(
+    model: StrandsDeciderModel,
+    examples: list[Example],
+    batches: list[list[int]],
+    coll_cfg: CollatorConfig,
+    device: str,
+) -> torch.Tensor:
     """`frozen_slot_log_probs` for every row the run trains on: ref[micro-batch, row].
 
     A fresh collator with the training collator's seed walks the run's micro-batches in
@@ -236,8 +240,7 @@ def _frozen_reference(model: StrandsDeciderModel, examples: list[Example], batch
     """
     rank, _, world = distributed.env()
     coll = SystemOneCollator(model.tokenizer, coll_cfg, train=True)
-    ref = torch.zeros(len(batches), max(map(len, batches)), model.config.num_slots,
-                      device=device)
+    ref = torch.zeros(len(batches), max(map(len, batches)), model.config.num_slots, device=device)
     todo: list[Any] = []  # (micro-batch, row, token ids, option count)
     for m, idx in enumerate(batches):
         rows = [examples[i] for i in idx]
@@ -252,7 +255,7 @@ def _frozen_reference(model: StrandsDeciderModel, examples: list[Example], batch
     i = 0
     while i < len(todo):
         longest = todo[i][2].numel()
-        chunk = todo[i:i + max(1, FROZEN_PASS_TOKENS // longest)]
+        chunk = todo[i : i + max(1, FROZEN_PASS_TOKENS // longest)]
         i += len(chunk)
         ts = [t for _, _, t, _ in chunk]  # right padding, as the collator pads
         ids = pad_sequence(ts, batch_first=True, padding_value=model.tokenizer.pad_token_id)
@@ -276,6 +279,12 @@ def train(cfg: TrainConfig) -> str:
     print(f"[strands-decider] loading base model {cfg.base_model}")
     model_cfg = StrandsDeciderConfig(
         base_model=cfg.base_model,
+        input_mode=cfg.input_mode,
+        base_revision=cfg.base_revision,
+        prompt_format=cfg.prompt_format,
+        max_images=cfg.max_images,
+        max_visual_tokens_per_image=cfg.max_visual_tokens_per_image,
+        max_total_visual_tokens=cfg.max_total_visual_tokens,
         num_slots=cfg.num_slots,
         head_hidden=cfg.head_hidden,
         head_dropout=cfg.head_dropout,
@@ -291,6 +300,13 @@ def train(cfg: TrainConfig) -> str:
         head_type=cfg.head_type,
         pointer_dim=cfg.pointer_dim,
     )
+    if cfg.input_mode == "multimodal":
+        if world > 1:
+            raise ValueError("multimodal training currently requires one process/GPU")
+        if cfg.init_from or cfg.head_init != "random" or cfg.precompute_frozen_kl:
+            raise ValueError(
+                "multimodal training does not support legacy head initialization or precomputed KL"
+            )
     if cfg.lora_targets:
         model_cfg.lora_targets = list(cfg.lora_targets)
     if cfg.init_from:
@@ -354,12 +370,18 @@ def train(cfg: TrainConfig) -> str:
                 d = json.loads(line)
                 ex = train_examples[d["i"]]
                 if len(d["probs"]) != ex.n_options:
-                    raise ValueError(f"teacher row {d['i']} has {len(d['probs'])} probs for "
-                                     f"{ex.n_options} options -- wrong train_files?")
+                    raise ValueError(
+                        f"teacher row {d['i']} has {len(d['probs'])} probs for "
+                        f"{ex.n_options} options -- wrong train_files?"
+                    )
+                if ex.images:
+                    raise ValueError("visual rows cannot carry text teacher targets")
                 ex.teacher = d["probs"]
                 n_t += 1
-        print(f"[strands-decider] teacher distributions on {n_t:,} of {len(train_examples):,} rows "
-              f"(weight {cfg.teacher_weight})")
+        print(
+            f"[strands-decider] teacher distributions on {n_t:,} of {len(train_examples):,} rows "
+            f"(weight {cfg.teacher_weight})"
+        )
     if cfg.val_files:
         val_examples = load_examples(cfg.val_files)
     else:
@@ -373,6 +395,8 @@ def train(cfg: TrainConfig) -> str:
             raise ValueError("labelled rows must have weight > 0: weight 0 marks KL-only rows")
         kl_rows = load_examples(cfg.kl_only_files)
         for ex in kl_rows:
+            if ex.images:
+                raise ValueError("visual rows cannot carry text replay targets")
             if ex.n_options > 9:
                 raise ValueError(f"KL-only row from {ex.task!r} has {ex.n_options} options")
             ex.weight = 0.0  # no label loss; the training loop reads 0 as "KL only"
@@ -380,7 +404,13 @@ def train(cfg: TrainConfig) -> str:
         train_examples = train_examples + kl_rows
         random.Random(cfg.seed).shuffle(train_examples)
         print(f"[strands-decider] +{len(kl_rows):,} KL-only rows (weight {cfg.kl_only_weight})")
+    if cfg.input_mode == "multimodal":
+        assert_disjoint(train=train_examples, validation=val_examples)
     print(f"[strands-decider] train={len(train_examples):,} val={len(val_examples):,}")
+    print(
+        f"[strands-decider] objective rows: visual_supervised={sum(bool(ex.images) for ex in train_examples)} "
+        f"text_reference_eligible={sum(not ex.images for ex in train_examples)}"
+    )
     if not train_examples:
         raise SystemExit("no training examples; run `strands-decider data build` first")
 
@@ -393,22 +423,43 @@ def train(cfg: TrainConfig) -> str:
         seed=cfg.seed,
         head_type=cfg.head_type,
     )
-    train_collate = SystemOneCollator(model.tokenizer, coll_cfg, train=True)
+    visual_kwargs = (
+        {"processor": model.processor, "vision_budget": model.config.vision_budget()}
+        if cfg.input_mode == "multimodal"
+        else {}
+    )
+    train_collate = SystemOneCollator(model.tokenizer, coll_cfg, train=True, **visual_kwargs)
     if cfg.group_by_length:
-        lengths = [example_length(ex) for ex in train_examples]
+        lengths = (
+            [
+                int(
+                    SystemOneCollator(model.tokenizer, coll_cfg, train=False, **visual_kwargs)(
+                        [ex]
+                    )["attention_mask"].sum()
+                )
+                for ex in train_examples
+            ]
+            if cfg.input_mode == "multimodal"
+            else [example_length(ex) for ex in train_examples]
+        )
         sampler = LengthGroupedBatchSampler(
-            lengths, cfg.micro_batch_size, mega=cfg.length_group_mega,
-            seed=cfg.seed, drop_last=True,
+            lengths,
+            cfg.micro_batch_size,
+            mega=cfg.length_group_mega,
+            seed=cfg.seed,
+            drop_last=True,
         )
         # Measured in prompt characters, the proxy the sampler sorts by -- which flatters
         # the grouped figure, since grouping is exact in that unit. Tables and prose
         # tokenise at different rates, so real token padding is higher (measured ~16%
         # grouped against ~58% ungrouped on the v10 corpus). The ungrouped figure agrees
         # in both units, so the comparison is still a fair signal of what was saved.
-        print(f"[strands-decider] length-grouped batching: padding "
-              f"{padding_fraction(lengths, sampler.batches(0)):.1%} of positions grouped vs "
-              f"{padding_fraction(lengths, _random_batches(len(lengths), cfg)):.1%} "
-              f"ungrouped (in prompt characters; token padding runs higher)")
+        print(
+            f"[strands-decider] length-grouped batching: padding "
+            f"{padding_fraction(lengths, sampler.batches(0)):.1%} of positions grouped vs "
+            f"{padding_fraction(lengths, _random_batches(len(lengths), cfg)):.1%} "
+            f"ungrouped (in prompt characters; token padding runs higher)"
+        )
         train_loader = DataLoader(
             ExampleDataset(train_examples),
             batch_sampler=sampler,
@@ -428,7 +479,7 @@ def train(cfg: TrainConfig) -> str:
         ExampleDataset(val_examples),
         batch_size=cfg.micro_batch_size,
         shuffle=False,
-        collate_fn=SystemOneCollator(model.tokenizer, coll_cfg, train=False),
+        collate_fn=SystemOneCollator(model.tokenizer, coll_cfg, train=False, **visual_kwargs),
     )
 
     steps_per_epoch = max(1, len(train_loader) // cfg.grad_accum)
@@ -436,14 +487,40 @@ def train(cfg: TrainConfig) -> str:
     warmup = max(1, int(total_steps * cfg.warmup_ratio))
 
     optim = _build_optimizer(model, cfg)
-    sched = torch.optim.lr_scheduler.LambdaLR(
-        optim, lambda s: _lr_lambda(s, warmup, total_steps)
-    )
+    sched = torch.optim.lr_scheduler.LambdaLR(optim, lambda s: _lr_lambda(s, warmup, total_steps))
 
     if rank == 0:
         os.makedirs(cfg.output_dir, exist_ok=True)
         with open(os.path.join(cfg.output_dir, "train_config.json"), "w", encoding="utf-8") as fh:
             json.dump(asdict(cfg), fh, indent=2)
+        if cfg.input_mode == "multimodal":
+            import hashlib
+            from pathlib import Path
+
+            source_manifests = {
+                path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                for path in [*cfg.train_files, *cfg.val_files, *cfg.kl_only_files]
+            }
+            groups = {
+                name: sorted(
+                    hashlib.sha256(key.encode()).hexdigest()
+                    for key in {key for ex in rows for key in group_keys(ex)}
+                )
+                for name, rows in (("train", train_examples), ("validation", val_examples))
+            }
+            with open(
+                os.path.join(cfg.output_dir, "dataset_manifest.json"), "w", encoding="utf-8"
+            ) as fh:
+                json.dump(
+                    {
+                        "source_manifest_sha256": source_manifests,
+                        "group_key_sha256": groups,
+                        "rows": {"train": len(train_examples), "validation": len(val_examples)},
+                    },
+                    fh,
+                    indent=2,
+                    sort_keys=True,
+                )
     slots = model.slot_token_ids()  # the rows frozen_slot_log_probs covers
     kl_slots = max(slots) + 1 if slots else 0
     if world > 1:  # each rank iterates its share of every step's rows instead
@@ -456,10 +533,13 @@ def train(cfg: TrainConfig) -> str:
         run = [b for e in range(cfg.epochs) for b in sampler.batches(e)]
         t_ref = time.time()
         model.train()  # the mode the in-step reference forward runs in
-        refs = _frozen_reference(model, train_examples, run[: total_steps * cfg.grad_accum],
-                                 coll_cfg, device)
-        print(f"[strands-decider] frozen-KL reference for {refs.shape[0]:,} micro-batches "
-              f"in {time.time() - t_ref:.0f} s")
+        refs = _frozen_reference(
+            model, train_examples, run[: total_steps * cfg.grad_accum], coll_cfg, device
+        )
+        print(
+            f"[strands-decider] frozen-KL reference for {refs.shape[0]:,} micro-batches "
+            f"in {time.time() - t_ref:.0f} s"
+        )
 
     print(f"[strands-decider] {total_steps} optimizer steps (warmup {warmup})")
     model.train()
@@ -475,27 +555,17 @@ def train(cfg: TrainConfig) -> str:
         for batch in train_loader:
             # Under torchrun a forward is this rank's slice of a micro-batch (distributed.py).
             part = batch.pop("part", distributed.WHOLE)
-            batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            batch = move_model_inputs(batch, device, model.torso)
             if world > 1:  # what DDP's no_sync() sets: all-reduce on the step's last forward
                 fwd.require_backward_grad_sync = part.last
-            out = fwd(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                n_slots=batch["n_slots"],
-                opt_idx=batch.get("opt_idx"),
-                labels=batch["labels"],
-                label_dist=batch.get("label_dist"),
-                weights=batch.get("weights"),
-            )
+            out = fwd(**model_inputs(batch))
             step_loss = out["loss"] * part.weights
             if cfg.kl_frozen_weight > 0:
                 if refs is None:
-                    ref_lp, eligible = model.frozen_slot_log_probs(
-                        batch["input_ids"], batch["attention_mask"], batch["n_slots"]
-                    )
+                    ref_lp, eligible = text_reference(model, batch)
                 else:  # the same numbers, computed before step 1 (_frozen_reference)
                     m, a = (part.micro, part.start) if world > 1 else (micro, 0)
-                    ref_lp = refs[m, a:a + batch["labels"].numel()]
+                    ref_lp = refs[m, a : a + batch["labels"].numel()]
                     eligible = batch["n_slots"] <= kl_slots
                 if ref_lp.numel() and bool(eligible.any()):
                     ref = ref_lp[eligible]
@@ -522,7 +592,11 @@ def train(cfg: TrainConfig) -> str:
                     else:
                         step_loss = step_loss + cfg.kl_frozen_weight * kl
                     running_kl += float(kl)
-            if cfg.teacher_weight > 0 and "has_teacher" in batch and bool(batch["has_teacher"].any()):
+            if (
+                cfg.teacher_weight > 0
+                and "has_teacher" in batch
+                and bool(batch["has_teacher"].any())
+            ):
                 has = batch["has_teacher"]
                 stu = out["log_probs"][has]
                 tea = batch["teacher"][has][:, : stu.shape[-1]]
@@ -551,7 +625,8 @@ def train(cfg: TrainConfig) -> str:
 
             if step % cfg.log_every == 0:
                 running, running_kl, running_tkl = distributed.all_reduce(
-                    [running, running_kl, running_tkl])  # each rank holds its slices' part
+                    [running, running_kl, running_tkl]
+                )  # each rank holds its slices' part
                 avg = running / (cfg.log_every * cfg.grad_accum)
                 rate = step / max(1e-6, time.time() - t0)
                 mem = torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else 0.0
@@ -595,3 +670,39 @@ def train(cfg: TrainConfig) -> str:
         json.dump(history, fh, indent=2)
     print(f"[strands-decider] saved to {cfg.output_dir}")
     return cfg.output_dir
+
+
+def model_inputs(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    keys = {
+        "input_ids",
+        "attention_mask",
+        "n_slots",
+        "opt_idx",
+        "labels",
+        "label_dist",
+        "weights",
+        "answer_positions",
+        "pixel_values",
+        "image_grid_thw",
+        "mm_token_type_ids",
+        "position_ids",
+    }
+    return {key: value for key, value in batch.items() if key in keys}
+
+
+def text_reference(
+    model: StrandsDeciderModel, batch: dict[str, torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Never forward image placeholders to the legacy text reference objective."""
+    visual = batch.get("visual_rows", torch.zeros_like(batch["n_slots"], dtype=torch.bool))
+    text = ~visual
+    ref = torch.full((len(text), model.config.num_slots), float("-inf"), device=text.device)
+    eligible = torch.zeros_like(text)
+    if bool(text.any()):
+        lp, valid = model.frozen_slot_log_probs(
+            batch["input_ids"][text], batch["attention_mask"][text], batch["n_slots"][text]
+        )
+        if lp.numel():
+            ref[text, : lp.shape[1]] = lp
+            eligible[text] = valid
+    return ref, eligible

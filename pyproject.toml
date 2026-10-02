@@ -27,9 +27,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+vision = ["pillow>=11", "torchvision>=0.22"]
 # Only the corpus build uses datasets: `strands-decider data build` and `python -m strands_decider.data.multistep`.
 train = ["datasets>=2.20"]
 dev = [
+    "types-Pillow",
     "pytest>=8.0",
     "ruff>=0.6",
     "mypy>=1.15,<3",

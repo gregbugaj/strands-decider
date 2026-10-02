@@ -1,0 +1,36 @@
+# Experimental single-GPU profile, not a measured capacity or quality guarantee.
+# Supply real grouped manifests and --base-revision <40-character Hub commit>.
+train_files: []
+val_files: []
+base_model: Qwen/Qwen3.5-2B
+base_revision: null
+input_mode: multimodal
+prompt_format: vision-v1
+head_type: pointer
+pointer_dim: 256
+max_images: 4
+max_visual_tokens_per_image: 1024
+max_total_visual_tokens: 4096
+max_length: 8192
+use_lora: true
+lora_r: 16
+lora_alpha: 32
+lora_targets: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj,
+               in_proj_qkv, in_proj_z, in_proj_a, in_proj_b, out_proj]
+freeze_torso: false
+head_init: random
+kl_frozen_weight: 0.0
+teacher_weight: 0.0
+micro_batch_size: 1
+grad_accum: 8
+epochs: 1
+lr: 0.0001
+head_lr: 0.001
+gradient_checkpointing: true
+group_by_length: true
+shuffle_options: true
+ordinal_smoothing: 0.1
+output_dir: checkpoints/decider-vision-experiment
+seed: 0
+log_every: 20
+eval_every: 500

@@ -100,3 +100,5 @@ Rank on JevBench ([External benchmark](jevbench.md#external-benchmark-jevbench-v
   JevBench public by about 3 tasks (six v17 retrains on AWS, SD 3.2 tasks,
   [Retraining on AWS](results.md#retraining-on-aws)). Treat smaller single-run differences as unresolved, not as
   results either way.
+
+For image/OCR ablations and independent document-grouped calibration, see [visual evaluation](../docs/vision.md#qualification-and-export).

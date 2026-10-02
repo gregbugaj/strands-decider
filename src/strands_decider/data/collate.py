@@ -17,6 +17,7 @@ from typing import Any
 import torch
 
 from ..prompting import build_prompt
+from ..vision import ImageLimits, VisionBudget, decode_images, prepare_vision_batch
 from .format import Example
 
 
@@ -42,11 +43,23 @@ class CollatorConfig:
 class SystemOneCollator:
     """Turns a list of Examples into a padded, tokenised training batch."""
 
-    def __init__(self, tokenizer: Any, config: CollatorConfig, *, train: bool = True):
+    def __init__(
+        self,
+        tokenizer: Any,
+        config: CollatorConfig,
+        *,
+        train: bool = True,
+        processor: Any = None,
+        vision_budget: VisionBudget | None = None,
+    ):
         self.tok = tokenizer
         self.cfg = config
         self.train = train
         self.rng = random.Random(config.seed)
+        self.processor = processor
+        self.vision_budget = vision_budget
+        if processor is not None and (vision_budget is None or config.head_type != "pointer"):
+            raise ValueError("multimodal collator requires a pointer head and visual budgets")
 
     # ---- option ordering -------------------------------------------------
 
@@ -128,7 +141,12 @@ class SystemOneCollator:
     # ---- targets ---------------------------------------------------------
 
     def _target_distribution(
-        self, ex: Example, label: int, n_options: int, order: Sequence[int] | None
+        self,
+        ex: Example,
+        label: int,
+        n_options: int,
+        order: Sequence[int] | None,
+        width: int | None = None,
     ) -> torch.Tensor | None:
         """Soft target for score questions; None for noul/choice (plain NLL is right there).
 
@@ -139,7 +157,7 @@ class SystemOneCollator:
         if ex.kind != "score" or self.cfg.ordinal_smoothing <= 0:
             return None
 
-        dist = torch.zeros(self.cfg.num_slots, dtype=torch.float32)
+        dist = torch.zeros(width if width is not None else self.cfg.num_slots, dtype=torch.float32)
         eps = self.cfg.ordinal_smoothing
         gold_level = ex.label
         neighbours = [lv for lv in (gold_level - 1, gold_level + 1) if 0 <= lv < n_options]
@@ -168,8 +186,18 @@ class SystemOneCollator:
         teachers: list[list[float] | None] = []
 
         pointer = self.cfg.head_type == "pointer"
+        target_width = (
+            max(self.cfg.num_slots, max(ex.n_options for ex in batch))
+            if pointer
+            else self.cfg.num_slots
+        )
         spans: list[Any] = []
+        rendered = []
         for ex in batch:
+            if ex.images and self.processor is None:
+                raise ValueError("visual rows require a multimodal collator")
+            if ex.images and (getattr(ex, "teacher", None) is not None or ex.weight <= 0):
+                raise ValueError("visual rows cannot carry text teacher/replay targets")
             # A pointer head has no fixed slot count, so only the slot head caps options.
             if not pointer and ex.n_options > self.cfg.num_slots:
                 raise ValueError(
@@ -183,28 +211,41 @@ class SystemOneCollator:
                 option_order=order,
             )
             texts.append(prompt)
+            rendered.append(rq)
             # Option spans are relative to the question; the prompt is state + question.
             spans.append((len(prompt) - len(rq.text), rq.option_spans))
             labels.append(self._remap_label(ex.label, order))
             n_slots.append(ex.n_options)
-            dists.append(self._target_distribution(ex, ex.label, ex.n_options, order))
+            dists.append(self._target_distribution(ex, ex.label, ex.n_options, order, target_width))
             weights.append(ex.weight)
             # A teacher's distribution (train.py attaches it) is in canonical option
             # order; slot k shows canonical option order[k], exactly as for the label.
             t = getattr(ex, "teacher", None)
             teachers.append(None if t is None else (t if order is None else [t[i] for i in order]))
 
-        enc = self.tok(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=self.cfg.max_length,
-            return_tensors="pt",
-            # Right padding: pool_last_token finds the final real token by mask length,
-            # and the shared-prefix cache in infer.py assumes the prompt starts at 0.
-            padding_side="right",
-            return_offsets_mapping=pointer,
-        )
+        prepared = None
+        if self.processor is not None:
+            assert self.vision_budget is not None
+            prepared = prepare_vision_batch(
+                self.processor,
+                [ex.state for ex in batch],
+                [decode_images(ex.to_images(), ImageLimits()) for ex in batch],
+                rendered,
+                self.vision_budget,
+            )
+            enc = prepared.tensors
+        else:
+            enc = self.tok(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=self.cfg.max_length,
+                return_tensors="pt",
+                # Right padding: pool_last_token finds the final real token by mask length,
+                # and the shared-prefix cache in infer.py assumes the prompt starts at 0.
+                padding_side="right",
+                return_offsets_mapping=pointer,
+            )
 
         out: dict[str, torch.Tensor] = {
             "input_ids": enc["input_ids"],
@@ -213,13 +254,17 @@ class SystemOneCollator:
             "labels": torch.tensor(labels, dtype=torch.long),
             "weights": torch.tensor(weights, dtype=torch.float32),
         }
+        if prepared is not None:
+            out.update(prepared.tensors)
+            out["answer_positions"] = prepared.answer_positions
+            out["opt_idx"] = prepared.opt_idx
+            out["visual_rows"] = torch.tensor([bool(ex.images) for ex in batch])
         width = self.cfg.num_slots
-        if pointer:
+        if prepared is not None:
+            width = prepared.opt_idx.shape[1]
+        elif pointer:
             offs = enc["offset_mapping"].tolist()
-            per = [
-                self.option_token_index(offs[i], sp, base)
-                for i, (base, sp) in enumerate(spans)
-            ]
+            per = [self.option_token_index(offs[i], sp, base) for i, (base, sp) in enumerate(spans)]
             width = max(len(p) for p in per)
             out["opt_idx"] = torch.tensor(
                 [p + [-1] * (width - len(p)) for p in per], dtype=torch.long
@@ -230,7 +275,7 @@ class SystemOneCollator:
                     d
                     if d is not None
                     else torch.nn.functional.one_hot(
-                        torch.tensor(lab), num_classes=self.cfg.num_slots
+                        torch.tensor(lab), num_classes=target_width
                     ).float()
                     for d, lab in zip(dists, labels, strict=True)
                 ]

@@ -175,3 +175,5 @@ The steps, each with its command, are in [steps.md](steps.md):
 [2. Label with the teacher](steps.md#2-label-with-the-teacher), [3. Train](steps.md#3-train),
 [4. Calibrate](steps.md#4-calibrate), [5. Evaluate](steps.md#5-evaluate) and
 [6. Serve](steps.md#6-serve).
+
+For the separate Qwen multimodal experiment, see [vision training and input contract](../docs/vision.md).

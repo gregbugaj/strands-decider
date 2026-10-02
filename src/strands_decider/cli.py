@@ -54,7 +54,9 @@ def data_recipes() -> None:
 def data_build(
     out: str = typer.Option("data/train.jsonl", help="Output JSONL (.gz supported)."),
     recipes: list[str] | None = typer.Option(
-        None, "--recipe", "-r",
+        None,
+        "--recipe",
+        "-r",
         help="Recipe name; repeat. Default: all. If a recipe fails, the build writes nothing.",
     ),
     max_options: int = typer.Option(16, help="Cap options per example (large label sets)."),
@@ -88,8 +90,11 @@ def data_build(
         except Exception as exc:
             # Stop here. A missing recipe removes rows and moves every later row to a new
             # position. The frozen teacher and replay targets attach to rows by position.
-            hint = (' Install the "train" extra: pip install -e ".[train]".'
-                    if isinstance(exc, ModuleNotFoundError) and exc.name == "datasets" else "")
+            hint = (
+                ' Install the "train" extra: pip install -e ".[train]".'
+                if isinstance(exc, ModuleNotFoundError) and exc.name == "datasets"
+                else ""
+            )
             raise SystemExit(f"recipe {name} failed, no corpus written: {exc!r}.{hint}") from exc
         (held if name in hold else kept).extend(examples)
         console.print(f"  [green]{len(examples):,}[/] examples")
@@ -157,6 +162,9 @@ def train_cmd(
     train_file: list[str] | None = typer.Option(None, "--train-file", help="Override data."),
     base_model: str | None = typer.Option(None, help="Override base model id."),
     output_dir: str | None = typer.Option(None, help="Override checkpoint directory."),
+    base_revision: str | None = typer.Option(
+        None, help="Immutable base commit for multimodal training."
+    ),
     epochs: int | None = typer.Option(None),
     micro_batch_size: int | None = typer.Option(None),
     max_steps: int | None = typer.Option(None, help="Hard step cap (smoke tests)."),
@@ -169,6 +177,7 @@ def train_cmd(
         cfg.train_files = list(train_file)
     for key, val in (
         ("base_model", base_model),
+        ("base_revision", base_revision),
         ("output_dir", output_dir),
         ("epochs", epochs),
         ("micro_batch_size", micro_batch_size),
@@ -256,8 +265,11 @@ def eval_cmd(
             t.add_column(col, justify="right" if col != "group" else "left")
         for name, m in rows.items():
             t.add_row(
-                name, f"{m['n']:,}", f"{m['accuracy']:.3f}",
-                f"{m['ece']:.3f}", f"{m['mean_confidence']:.3f}",
+                name,
+                f"{m['n']:,}",
+                f"{m['accuracy']:.3f}",
+                f"{m['ece']:.3f}",
+                f"{m['mean_confidence']:.3f}",
             )
         console.print(t)
 
@@ -298,31 +310,53 @@ def serve_cmd(
     host: str = typer.Option("127.0.0.1"),
     port: int = typer.Option(8000),
     device: str | None = typer.Option(
-        None, "--device",
+        None,
+        "--device",
         help="Torch device (cuda|mps|cpu). Auto-detected when omitted.",
     ),
     no_prefix_cache: bool = typer.Option(False, "--no-prefix-cache"),
+    max_request_bytes: int = typer.Option(40 * 1024 * 1024, min=1),
+    max_image_payload_bytes: int = typer.Option(32 * 1024 * 1024, min=1),
+    max_decoded_image_bytes: int = typer.Option(24 * 1024 * 1024, min=1),
+    max_pixels_per_image: int = typer.Option(16_000_000, min=1),
+    max_total_pixels: int = typer.Option(32_000_000, min=1),
     model_name: str | None = typer.Option(
-        None, "--model-name",
+        None,
+        "--model-name",
         help="Value returned as `model` in responses. Defaults to the checkpoint basename.",
     ),
 ) -> None:
     """Serve POST /v1/systemone. JevBench's typesafe adapter runs against it unchanged."""
     from .server import serve
+    from .vision import ImageLimits
 
     selected_device = device or _auto_device()
     _configure_inference_logging(selected_device)
     console.print(f"[green]serving[/] {checkpoint} on http://{host}:{port}")
     serve(
-        checkpoint, host=host, port=port, device=selected_device,
-        use_prefix_cache=not no_prefix_cache, model_name=model_name,
+        checkpoint,
+        host=host,
+        port=port,
+        device=selected_device,
+        use_prefix_cache=not no_prefix_cache,
+        model_name=model_name,
+        image_limits=ImageLimits(
+            max_request_bytes=max_request_bytes,
+            max_payload_bytes=max_image_payload_bytes,
+            max_decoded_bytes=max_decoded_image_bytes,
+            max_pixels_per_image=max_pixels_per_image,
+            max_total_pixels=max_total_pixels,
+        ),
     )
 
 
 @app.command("ask")
 def ask_cmd(
     checkpoint: str = typer.Argument(...),
-    state: str = typer.Option(..., "--state", "-s", help="The content to evaluate."),
+    state: str | None = typer.Option(None, "--state", "-s", help="The content to evaluate."),
+    image: list[str] | None = typer.Option(
+        None, "--image", help="Normalized RGB PNG/JPEG; repeat in page order."
+    ),
     noul: list[str] | None = typer.Option(None, "--noul", help="Yes/no question; repeat."),
     choice: list[str] | None = typer.Option(
         None, "--choice", help="'question?=opt1,opt2,opt3'; repeat."
@@ -331,7 +365,8 @@ def ask_cmd(
         None, "--score", help="'question?=low,mid,high' (ascending); repeat."
     ),
     device: str | None = typer.Option(
-        None, "--device",
+        None,
+        "--device",
         help="Torch device (cuda|mps|cpu). Auto-detected when omitted.",
     ),
     as_json: bool = typer.Option(False, "--json", help="Print the raw API response."),
@@ -361,8 +396,18 @@ def ask_cmd(
 
     selected_device = device or _auto_device()
     _configure_inference_logging(selected_device)
+    if state is None and not image:
+        raise typer.BadParameter("provide --state or at least one --image")
     engine = load_engine(checkpoint, device=selected_device)
-    response = engine.ask(state, questions)
+    if image:
+        from .vision import images_from_paths
+
+        try:
+            response = engine.ask(state or "", questions, images=images_from_paths(image))
+        except (ValueError, OSError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    else:
+        response = engine.ask(state or "", questions)
 
     if as_json:
         console.print_json(response.model_dump_json())
@@ -373,8 +418,7 @@ def ask_cmd(
             console.print(f"[bold]{name}[/] noul = [cyan]{ans.noul:.3f}[/]")
         elif ans.type == "choice":
             console.print(
-                f"[bold]{name}[/] -> [cyan]{ans.choice}[/] "
-                f"(confidence {ans.confidence:.3f})"
+                f"[bold]{name}[/] -> [cyan]{ans.choice}[/] (confidence {ans.confidence:.3f})"
             )
             for opt, p in sorted(ans.probabilities.items(), key=lambda kv: -kv[1]):
                 console.print(f"    {opt:<24} {p:.3f}")

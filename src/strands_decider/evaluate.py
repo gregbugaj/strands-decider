@@ -39,7 +39,8 @@ from .data.collate import CollatorConfig, SystemOneCollator
 from .data.format import Example
 from .modeling import MASK_VALUE, StrandsDeciderModel, config_path, masked_log_softmax
 from .schema import derive_confidence, derive_score_confidence
-from .train import ExampleDataset
+from .train import ExampleDataset, model_inputs
+from .vision import move_model_inputs
 
 
 def partition_examples(examples: list[Example], part: str, *, seed: int = 0) -> list[Example]:
@@ -58,9 +59,15 @@ def partition_examples(examples: list[Example], part: str, *, seed: int = 0) -> 
         return examples
     if part not in ("calib", "test"):
         raise ValueError(f"split must be one of calib|test|all, got {part!r}")
+    if any(ex.images or ex.document_id for ex in examples):
+        from .data.format import split_examples
+
+        calib, test = split_examples(examples, val_fraction=0.5, seed=seed)
+        return calib if part == "calib" else test
     want = 0 if part == "calib" else 1
     return [
-        ex for i, ex in enumerate(examples)
+        ex
+        for i, ex in enumerate(examples)
         if (hashlib.sha256(f"{seed}:{i}".encode()).digest()[0] & 1) == want
     ]
 
@@ -101,9 +108,7 @@ class Prediction:
     def confidence(self) -> float:
         """Must match what the server reports, or ECE measures the wrong thing."""
         if self.kind == "score":
-            return derive_score_confidence(
-                self.probs, ordinal_smoothing=self.ordinal_smoothing
-            )
+            return derive_score_confidence(self.probs, ordinal_smoothing=self.ordinal_smoothing)
         return derive_confidence(self.probs)
 
 
@@ -130,6 +135,11 @@ def collect_logits(
             head_type=model.config.head_type,
         ),
         train=False,  # no option shuffling: evaluation must be deterministic
+        **(
+            {"processor": model.processor, "vision_budget": model.config.vision_budget()}
+            if getattr(model.config, "input_mode", "text") == "multimodal"
+            else {}
+        ),
     )
     loader = DataLoader(
         ExampleDataset(examples), batch_size=batch_size, shuffle=False, collate_fn=coll
@@ -137,14 +147,11 @@ def collect_logits(
 
     all_logits, all_labels, all_slots = [], [], []
     for batch in loader:
-        batch = {k: v.to(device) for k, v in batch.items()}
-        out = model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            n_slots=batch["n_slots"],
-            opt_idx=batch.get("opt_idx"),
-            temperature=1.0,  # raw logits; calibration is applied afterwards
-        )
+        batch = move_model_inputs(batch, device, getattr(model, "torso", None))
+        inputs = model_inputs(batch)
+        for key in ("labels", "label_dist", "weights"):
+            inputs.pop(key, None)
+        out = model(**inputs, temperature=1.0)
         logits = out["logits"].float()
         # A pointer head scores a padded option slot from the hidden state at position
         # 0 (gather_options clamps the -1 index), so in a mixed-width batch these
@@ -161,8 +168,7 @@ def collect_logits(
     # MASK_VALUE keeps the extra columns inert under masked_log_softmax.
     width = max(t.size(1) for t in all_logits)
     all_logits = [
-        t if t.size(1) == width
-        else F.pad(t, (0, width - t.size(1)), value=MASK_VALUE)
+        t if t.size(1) == width else F.pad(t, (0, width - t.size(1)), value=MASK_VALUE)
         for t in all_logits
     ]
     return (
@@ -231,7 +237,9 @@ def fit_temperature_by_kind(
         sel = torch.tensor(idx, dtype=torch.long)
         out[kind] = float(
             fit_temperature(
-                logits[sel], labels[sel], n_slots[sel],
+                logits[sel],
+                labels[sel],
+                n_slots[sel],
                 objective=objective,
                 examples=[examples[i] for i in idx],
                 ordinal_smoothing=ordinal_smoothing,
@@ -358,12 +366,14 @@ def fit_temperature(
         if examples is None:
             raise ValueError("fitting to ECE needs the examples, to pick per-kind confidence")
         grid = [lo * (hi / lo) ** (i / (iters - 1)) for i in range(iters)]
-        return float(min(
-            grid,
-            key=lambda t: ece_at_temperature(
-                logits, labels, n_slots, examples, t, ordinal_smoothing
-            ),
-        ))
+        return float(
+            min(
+                grid,
+                key=lambda t: ece_at_temperature(
+                    logits, labels, n_slots, examples, t, ordinal_smoothing
+                ),
+            )
+        )
     if objective != "nll":
         raise ValueError(f"objective must be 'nll' or 'ece', got {objective!r}")
 
@@ -397,7 +407,10 @@ def evaluate_checkpoint(
 ) -> dict[str, Any]:
     model = StrandsDeciderModel.load(checkpoint)
     logits, labels, slots, exs = collect_logits(
-        model, examples, device=device, batch_size=batch_size,
+        model,
+        examples,
+        device=device,
+        batch_size=batch_size,
         max_length=model.config.max_length,
     )
     if apply_temperature:
@@ -406,8 +419,12 @@ def evaluate_checkpoint(
     else:
         t = 1.0
     preds = predictions_from_logits(
-        logits, labels, slots, exs,
-        temperature=t, ordinal_smoothing=model.config.ordinal_smoothing,
+        logits,
+        labels,
+        slots,
+        exs,
+        temperature=t,
+        ordinal_smoothing=model.config.ordinal_smoothing,
     )
     result = summarise(preds)
     result["temperature"] = t
@@ -433,7 +450,10 @@ def calibrate_checkpoint(
         )
     model = StrandsDeciderModel.load(checkpoint)
     logits, labels, slots, exs = collect_logits(
-        model, examples, device=device, batch_size=batch_size,
+        model,
+        examples,
+        device=device,
+        batch_size=batch_size,
         max_length=model.config.max_length,
     )
 

@@ -1,0 +1,43 @@
+{
+  "purpose": "pretrained runtime integration; untrained decision head and synthetic pixels, no accuracy qualification",
+  "base_model": "Qwen/Qwen3.5-4B",
+  "base_revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+  "device": "cpu",
+  "torch": "2.14.1+cu130",
+  "load_seconds": 2.0174397270020563,
+  "budgets": {
+    "max_images": 4,
+    "max_visual_tokens_per_image": 16,
+    "max_total_visual_tokens": 64,
+    "max_length": 4096
+  },
+  "cases": [
+    {
+      "images": 0,
+      "input_tokens": 76,
+      "latency_seconds": 1.863886218998232,
+      "finite_response": true
+    },
+    {
+      "images": 1,
+      "input_tokens": 116,
+      "latency_seconds": 3.018295471003512,
+      "finite_response": true
+    },
+    {
+      "images": 4,
+      "input_tokens": 248,
+      "latency_seconds": 5.276774493002449,
+      "finite_response": true
+    }
+  ],
+  "backward": {
+    "images": 1,
+    "finite_loss": true,
+    "head_gradients": true,
+    "decoder_adapter_gradients": true,
+    "vision_frozen": true,
+    "latency_seconds": 4.8451406309905
+  },
+  "production_vision_qualified": false
+}

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
@@ -41,6 +41,7 @@ from .schema import (
     Answer,
     ChoiceAnswer,
     Content,
+    ImageInput,
     NoulAnswer,
     Question,
     ScoreAnswer,
@@ -50,6 +51,7 @@ from .schema import (
     derive_confidence,
     derive_score_confidence,
 )
+from .vision import ImageLimits, decode_images, move_model_inputs, prepare_vision_batch
 
 
 @dataclass
@@ -61,6 +63,7 @@ class EngineConfig:
     # Largest share of the context window the question may claim before the state
     # starts being squeezed. Questions are normally short, so this rarely binds.
     max_question_fraction: float = 0.75
+    image_limits: ImageLimits = field(default_factory=ImageLimits)
 
 
 class UnforkableCache(TypeError):
@@ -95,15 +98,26 @@ def _fork_layered_cache(cache: Any, n: int) -> Any:
             is_state = name in _ROW_STATES
             if isinstance(v, torch.Tensor):
                 if not is_state:
-                    raise UnforkableCache(f"cache layer {type(layer).__name__} holds tensor {name!r}")
+                    raise UnforkableCache(
+                        f"cache layer {type(layer).__name__} holds tensor {name!r}"
+                    )
                 if v.numel():
                     setattr(nl, name, v.expand(n, *v.shape[1:]).contiguous())
             elif isinstance(v, dict):
                 if any(isinstance(t, torch.Tensor) for t in v.values()) and not is_state:
-                    raise UnforkableCache(f"cache layer {type(layer).__name__} holds tensors in {name!r}")
-                setattr(nl, name, {k: t.expand(n, *t.shape[1:]).contiguous()
-                                   if isinstance(t, torch.Tensor) and t.numel() else t
-                                   for k, t in v.items()})
+                    raise UnforkableCache(
+                        f"cache layer {type(layer).__name__} holds tensors in {name!r}"
+                    )
+                setattr(
+                    nl,
+                    name,
+                    {
+                        k: t.expand(n, *t.shape[1:]).contiguous()
+                        if isinstance(t, torch.Tensor) and t.numel()
+                        else t
+                        for k, t in v.items()
+                    },
+                )
         fork.layers.append(nl)
     return fork
 
@@ -162,7 +176,6 @@ class SystemOneEngine:
             dtype=torch.float32,
         )
 
-
     def _fit(self, state_text: str, question_texts: list[str]) -> tuple[list[int], list[list[int]]]:
         """Tokenise state and questions, giving the QUESTION first claim on the window.
 
@@ -180,8 +193,7 @@ class SystemOneEngine:
         arbitrary token -- whereas losing some instruction text only costs meaning.
         """
         max_len = self.model.config.max_length
-        enc = self.tok(question_texts, add_special_tokens=False,
-                       return_offsets_mapping=True)
+        enc = self.tok(question_texts, add_special_tokens=False, return_offsets_mapping=True)
         q = enc["input_ids"]
         offs = enc["offset_mapping"]
         longest = max(len(x) for x in q)
@@ -223,9 +235,7 @@ class SystemOneEngine:
         """Right-pad to a rectangle; pool_last_token finds the last real token by mask."""
         pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
         width = max(len(x) for x in seqs)
-        ids = torch.tensor(
-            [x + [pad_id] * (width - len(x)) for x in seqs], device=self.device
-        )
+        ids = torch.tensor([x + [pad_id] * (width - len(x)) for x in seqs], device=self.device)
         mask = torch.tensor(
             [[1] * len(x) + [0] * (width - len(x)) for x in seqs], device=self.device
         )
@@ -235,8 +245,11 @@ class SystemOneEngine:
 
     @torch.inference_mode()  # type: ignore[untyped-decorator]
     def _slot_probs_batched(
-        self, state_text: str, question_texts: list[str],
-        n_slots: list[int], kinds: list[str],
+        self,
+        state_text: str,
+        question_texts: list[str],
+        n_slots: list[int],
+        kinds: list[str],
         rendered: list[RenderedQuestion] | None = None,
     ) -> tuple[torch.Tensor, int]:
         """Fallback: encode each full prompt independently.
@@ -250,8 +263,11 @@ class SystemOneEngine:
         ids, mask = self._pad([s + qi for qi in q])
         # This path forwards the whole prompt, so option positions sit after the state.
         assert rendered is not None or self.model.config.head_type != "pointer"
-        opt_idx = (self._option_idx(rendered, len(s))  # type: ignore[arg-type]
-                   if self.model.config.head_type == "pointer" else None)
+        opt_idx = (
+            self._option_idx(rendered, len(s))  # type: ignore[arg-type]
+            if self.model.config.head_type == "pointer"
+            else None
+        )
         out = self.model(
             input_ids=ids,
             attention_mask=mask,
@@ -321,7 +337,46 @@ class SystemOneEngine:
 
     # ---- public ----------------------------------------------------------
 
+    @torch.inference_mode()
+    def _evaluate_vision(self, request: SystemOneRequest) -> SystemOneResponse:
+        budget = self.model.config.vision_budget()
+        if len(request.images) > budget.max_images:
+            raise ValueError(
+                f"image count {len(request.images)} exceeds allowed {budget.max_images}"
+            )
+        images = decode_images(request.images, self.cfg.image_limits)
+        answers: dict[str, Answer] = {}
+        total_tokens = 0
+        for name, question in request.questions.items():
+            rq = render_question(question)
+            prepared = prepare_vision_batch(
+                self.model.processor, [request.state], [images], [rq], budget
+            )
+            inputs = move_model_inputs(prepared.tensors, self.device, self.model.torso)
+            out = self.model(
+                **inputs,
+                opt_idx=prepared.opt_idx.to(self.device),
+                answer_positions=prepared.answer_positions.to(self.device),
+                n_slots=torch.tensor([rq.n_slots], device=self.device),
+                temperature=self._temperatures([rq.kind]),
+            )
+            probabilities = out["log_probs"][0, : rq.n_slots].exp().tolist()
+            answers[name] = _to_answer(
+                rq, probabilities, ordinal_smoothing=self.model.config.ordinal_smoothing
+            )
+            total_tokens += prepared.sequence_tokens[0]
+        return SystemOneResponse(
+            model=self.cfg.model_name,
+            answers=answers,
+            usage=Usage(input_tokens=total_tokens, output_tokens=len(answers)),
+        )
+
     def evaluate(self, request: SystemOneRequest) -> SystemOneResponse:
+        mode = getattr(self.model.config, "input_mode", "text")
+        if request.images and mode == "text":
+            raise ValueError("images require a multimodal checkpoint; this is a text checkpoint")
+        if mode == "multimodal":
+            return self._evaluate_vision(request)
         names = list(request.questions.keys())
         questions: list[Question] = [request.questions[n] for n in names]
 
@@ -360,17 +415,25 @@ class SystemOneEngine:
             if self.cfg.use_prefix_cache and len(chunk_rendered) > 1:
                 try:
                     probs, ntok = self._slot_probs_shared_prefix(
-                        state_text, [rq.text for rq in chunk_rendered], chunk_slots,
-                        chunk_kinds, rendered=chunk_rendered,
+                        state_text,
+                        [rq.text for rq in chunk_rendered],
+                        chunk_slots,
+                        chunk_kinds,
+                        rendered=chunk_rendered,
                     )
                     total_tokens += ntok
                 except UnforkableCache as e:
-                    print(f"[strands-decider] shared-prefix cache disabled ({e}); using batched encoding")
+                    print(
+                        f"[strands-decider] shared-prefix cache disabled ({e}); using batched encoding"
+                    )
                     self.cfg = replace(self.cfg, use_prefix_cache=False)
             if probs is None:
                 probs, ntok = self._slot_probs_batched(
-                    state_text, [rq.text for rq in chunk_rendered], chunk_slots,
-                    chunk_kinds, rendered=chunk_rendered,
+                    state_text,
+                    [rq.text for rq in chunk_rendered],
+                    chunk_slots,
+                    chunk_kinds,
+                    rendered=chunk_rendered,
                 )
                 total_tokens += ntok
 
@@ -388,8 +451,16 @@ class SystemOneEngine:
             usage=Usage(input_tokens=total_tokens, output_tokens=len(names)),
         )
 
-    def ask(self, state: Content, questions: dict[str, Question]) -> SystemOneResponse:
-        return self.evaluate(SystemOneRequest(state=state, questions=questions))
+    def ask(
+        self,
+        state: Content,
+        questions: dict[str, Question],
+        *,
+        images: list[ImageInput] | None = None,
+    ) -> SystemOneResponse:
+        return self.evaluate(
+            SystemOneRequest(state=state, questions=questions, images=images or [])
+        )
 
 
 def _option_token_index(
@@ -445,9 +516,7 @@ def _to_answer(
         probabilities={k: round(v, 4) for k, v in ordered.items()},
         # Ordinal confidence, not max-probability: see derive_score_confidence.
         confidence=round(
-            derive_score_confidence(
-                list(ordered.values()), ordinal_smoothing=ordinal_smoothing
-            ),
+            derive_score_confidence(list(ordered.values()), ordinal_smoothing=ordinal_smoothing),
             4,
         ),
     )
@@ -462,6 +531,4 @@ def load_engine(
     attn_implementation: str | None = None,
 ) -> SystemOneEngine:
     model = StrandsDeciderModel.load(checkpoint, attn_implementation=attn_implementation)
-    return SystemOneEngine(
-        model, EngineConfig(device=device, use_prefix_cache=use_prefix_cache)
-    )
+    return SystemOneEngine(model, EngineConfig(device=device, use_prefix_cache=use_prefix_cache))

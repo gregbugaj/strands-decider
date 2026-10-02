@@ -41,6 +41,9 @@ agentic workflows built with the [Strands Agents SDK](https://github.com/strands
 
 ## Getting Started
 
+For installation from this checkout with Astral `uv`, inference and server examples,
+and the proposed lockfile migration, see [README-UV.md](README-UV.md).
+
 The easiest place to get started is through the `strands-decider` cli:
 
 ```bash
@@ -120,6 +123,46 @@ strands-decider ask StrandsAgents/strands-decider-2B-hobson-v19 \
     2: depressed                                0.263
   ```
 </details>
+
+### Query an image now with pretrained Qwen
+
+The cached vision checkpoint on this machine is **Qwen/Qwen3.5-4B**:
+
+```text
+/home/gbugaj/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+```
+
+The following command uses the checkout's existing `.venv`, the real cached weights,
+and the included synthetic RGB invoice. It runs offline on CPU:
+
+```bash
+cd /home/gbugaj/dev/marieai/strands-decider
+HF_HUB_OFFLINE=1 .venv/bin/python examples/vision/query_image.py \
+  --model /home/gbugaj/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
+  --image examples/vision/sample-invoice.png \
+  --question "What is the invoice number and total amount due?" \
+  --device cpu \
+  --max-new-tokens 64
+```
+
+Verified locally on the included image: `The invoice number is INV-1042, and the
+total amount due is $125.00.`
+
+Replace `--image examples/vision/sample-invoice.png` with your image path and change
+`--question` to your question. Repeat `--image` for up to four pages, in the order
+you want the model to read them. Omit `--image` for a text-only question. Inputs must
+be normalized **8-bit RGB PNG/JPEG**; convert TIFFs and extract pages upstream.
+The example caps each image at 1,024 visual tokens and prompt plus output at 8,192
+tokens. Use `--max-visual-tokens-per-image` to adjust the image budget and
+`--max-new-tokens` for longer answers. CPU loading uses float32; CUDA uses bfloat16
+with `--device cuda`, when enough GPU memory is available.
+
+This example uses Qwen's pretrained language head to generate a free-form answer.
+**A trained visual Decider checkpoint does not exist yet.** The published v19
+Decider is text-only, and the cached Qwen directory cannot be passed directly to
+`strands-decider ask`. Decider's new optional-image path returns typed decisions
+after training its pointer head and decoder adapter. See [vision usage and training](docs/vision.md)
+and the [verification record](docs/vision-implementation-status.md).
 
 ### Running as a server
 
@@ -286,3 +329,5 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+
+See [optional multi-image vision](docs/vision.md) for normalized images, text-only requests, training, and qualification.

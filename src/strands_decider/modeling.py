@@ -19,14 +19,18 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoModel, AutoTokenizer
+
+if TYPE_CHECKING:
+    from .vision import VisionBudget
 
 # Slots the head can address. This must match the largest option count the corpus
 # actually contains: slots beyond that never receive a gradient and would ship at
@@ -42,6 +46,13 @@ MASK_VALUE = -1e4
 @dataclass
 class StrandsDeciderConfig:
     base_model: str = "Qwen/Qwen3-1.7B-Base"
+    input_mode: str = "text"
+    base_revision: str | None = None
+    prompt_format: str | None = None
+    max_images: int | None = None
+    max_visual_tokens_per_image: int | None = None
+    max_total_visual_tokens: int | None = None
+    processor_files: list[str] = field(default_factory=list)
     num_slots: int = DEFAULT_NUM_SLOTS
     # 0 = single linear projection. >0 inserts one GELU hidden layer of this width.
     head_hidden: int = 0
@@ -79,10 +90,37 @@ class StrandsDeciderConfig:
     lora_dropout: float = 0.05
     lora_targets: list[str] = field(
         default_factory=lambda: [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
         ]
     )
+
+    def __post_init__(self) -> None:
+        if self.input_mode not in {"text", "multimodal"}:
+            raise ValueError("input_mode must be text or multimodal")
+        if self.input_mode == "multimodal":
+            if not self.base_revision or not re.fullmatch(r"[0-9a-f]{40}", self.base_revision):
+                raise ValueError(
+                    "multimodal base_revision must be an immutable 40-character commit revision"
+                )
+            if self.prompt_format != "vision-v1" or self.head_type != "pointer":
+                raise ValueError("multimodal models require vision-v1 prompts and a pointer head")
+            self.vision_budget()
+
+    def vision_budget(self) -> VisionBudget:
+        from .vision import VisionBudget
+
+        values = (self.max_images, self.max_visual_tokens_per_image, self.max_total_visual_tokens)
+        if any(value is None or value <= 0 for value in values):
+            raise ValueError("multimodal image and token budgets must be explicit and positive")
+        return VisionBudget(
+            cast(int, values[0]), cast(int, values[1]), cast(int, values[2]), self.max_length
+        )
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -90,7 +128,23 @@ class StrandsDeciderConfig:
     @classmethod
     def from_json(cls, path: str) -> StrandsDeciderConfig:
         with open(path, encoding="utf-8") as fh:
-            return cls(**json.load(fh))
+            return cls.from_dict(json.load(fh))
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> StrandsDeciderConfig:
+        if raw.get("input_mode", "text") == "multimodal":
+            required = {
+                "max_images",
+                "max_visual_tokens_per_image",
+                "max_total_visual_tokens",
+                "max_length",
+            }
+            missing = required - raw.keys()
+            if missing:
+                raise ValueError(
+                    f"multimodal config requires explicit budget keys: {sorted(missing)}"
+                )
+        return cls(**raw)
 
 
 class SlotHead(nn.Module):
@@ -146,12 +200,12 @@ class PointerHead(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.q = nn.Linear(hidden_size, dim)
         self.k = nn.Linear(hidden_size, dim)
-        self.scale = dim ** -0.5
+        self.scale = dim**-0.5
 
     def forward(self, decide: torch.Tensor, options: torch.Tensor) -> torch.Tensor:
         """decide [B, d], options [B, K, d] -> logits [B, K]."""
-        d = self.q(self.dropout(self.norm(decide))).unsqueeze(-1)   # [B, dim, 1]
-        o = self.k(self.dropout(self.norm(options)))                # [B, K, dim]
+        d = self.q(self.dropout(self.norm(decide))).unsqueeze(-1)  # [B, dim, 1]
+        o = self.k(self.dropout(self.norm(options)))  # [B, K, dim]
         return (o @ d).squeeze(-1) * self.scale
 
 
@@ -243,11 +297,17 @@ class StrandsDeciderModel(nn.Module):
         self.config = config
         self.torso = torso
         self.tokenizer = tokenizer
+        self.processor: Any = None
+        if config.input_mode == "multimodal":
+            for parameter in cast(nn.Module, torso.visual).parameters():
+                parameter.requires_grad_(False)
         self.head = build_head(config, self.hidden_size(torso))
 
     @staticmethod
     def hidden_size(torso: nn.Module) -> int:
         cfg = getattr(torso, "config", None)
+        if cfg is not None and getattr(cfg, "text_config", None) is not None:
+            cfg = cfg.text_config
         for attr in ("hidden_size", "n_embd", "d_model"):
             if cfg is not None and getattr(cfg, attr, None):
                 return int(getattr(cfg, attr))
@@ -262,12 +322,22 @@ class StrandsDeciderModel(nn.Module):
         attn_implementation: str | None = None,
     ) -> StrandsDeciderModel:
         """Load the base model's torso (AutoModel, so no LM head) and attach LoRA."""
-        tok = AutoTokenizer.from_pretrained(config.base_model)
+        processor = None
+        if config.input_mode == "multimodal":
+            from transformers import AutoProcessor
+
+            processor = AutoProcessor.from_pretrained(
+                config.base_model, revision=config.base_revision
+            )
+            tok = processor.tokenizer
+        else:
+            tok = AutoTokenizer.from_pretrained(config.base_model)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
 
         torso = cls._load_torso(config, device_map, attn_implementation)
         model = cls(config, torso, tok)
+        model.processor = processor
         if config.use_lora:
             model.attach_lora()
         return model
@@ -283,7 +353,15 @@ class StrandsDeciderModel(nn.Module):
             kwargs["device_map"] = device_map
         if attn_implementation:
             kwargs["attn_implementation"] = attn_implementation
-        base_cfg = AutoConfig.from_pretrained(config.base_model)
+        if config.base_revision:
+            kwargs["revision"] = config.base_revision
+        base_cfg = AutoConfig.from_pretrained(config.base_model, revision=config.base_revision)
+        if config.input_mode == "multimodal":
+            from transformers import Qwen3_5Model
+
+            if base_cfg.model_type != "qwen3_5":
+                raise ValueError("multimodal Decider requires a full Qwen3.5 configuration")
+            return Qwen3_5Model.from_pretrained(config.base_model, config=base_cfg, **kwargs)
         if base_cfg.model_type in {"qwen3_5", "qwen3_5_text"}:
             # Qwen3.5 checkpoints are multimodal; AutoModel would hand back the wrapper with
             # a vision tower. Load the text tower through its causal-LM class, which maps the
@@ -313,11 +391,22 @@ class StrandsDeciderModel(nn.Module):
     def attach_lora(self) -> None:
         from peft import LoraConfig, get_peft_model
 
+        targets = self.config.lora_targets
+        if self.config.input_mode == "multimodal":
+            targets = [
+                name
+                for name, module in self.torso.named_modules()
+                if name.startswith("language_model.")
+                and isinstance(module, nn.Linear)
+                and name.rsplit(".", 1)[-1] in targets
+            ]
+            if not targets:
+                raise ValueError("no decoder LoRA target modules matched")
         lora_cfg = LoraConfig(
             r=self.config.lora_r,
             lora_alpha=self.config.lora_alpha,
             lora_dropout=self.config.lora_dropout,
-            target_modules=self.config.lora_targets,
+            target_modules=targets,
             bias="none",
             # No PEFT task head -- our SlotHead is the task head and is saved separately.
             task_type="FEATURE_EXTRACTION",
@@ -338,16 +427,21 @@ class StrandsDeciderModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         past_key_values: Any = None,
+        **vision_inputs: Any,
     ) -> torch.Tensor:
+        if self.config.input_mode == "text" and any(
+            vision_inputs.get(key) is not None for key in ("pixel_values", "image_grid_thw")
+        ):
+            raise ValueError("image tensors require a multimodal model, not a text checkpoint")
         out = self.torso(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=past_key_values is not None,
             return_dict=True,
+            **{key: value for key, value in vision_inputs.items() if value is not None},
         )
         return out.last_hidden_state
-
 
     # ---- pretrained-readout hooks ------------------------------------------
     def slot_token_ids(self) -> dict[int, int]:
@@ -379,6 +473,7 @@ class StrandsDeciderModel(nn.Module):
         if emb is None:
             raise RuntimeError("torso exposes no input embedding to use as an LM head")
         cfg = getattr(self.torso, "config", None)
+        cfg = getattr(cfg, "text_config", cfg)
         if cfg is not None and not getattr(cfg, "tie_word_embeddings", False):
             raise RuntimeError(
                 "base model does not tie embeddings, so the input table is not the LM head"
@@ -442,9 +537,27 @@ class StrandsDeciderModel(nn.Module):
         past_key_values: Any = None,
         temperature: Any | None = None,
         opt_idx: torch.Tensor | None = None,
+        answer_positions: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+        mm_token_type_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        hidden = self.encode(input_ids, attention_mask, past_key_values=past_key_values)
-        pooled = pool_last_token(hidden, attention_mask).to(torch.float32)
+        hidden = self.encode(
+            input_ids,
+            attention_mask,
+            past_key_values=past_key_values,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            mm_token_type_ids=mm_token_type_ids,
+            position_ids=position_ids,
+        )
+        if answer_positions is None:
+            pooled = pool_last_token(hidden, attention_mask).to(torch.float32)
+        else:
+            pooled = hidden[
+                torch.arange(hidden.size(0), device=hidden.device), answer_positions
+            ].float()
         if self.config.head_type == "pointer":
             if opt_idx is None:
                 raise ValueError("pointer head needs opt_idx (option token positions)")
@@ -456,8 +569,9 @@ class StrandsDeciderModel(nn.Module):
         else:
             logits = self.head(pooled)
 
-        logits = apply_temperature(logits, self.config.temperature
-                                   if temperature is None else temperature)
+        logits = apply_temperature(
+            logits, self.config.temperature if temperature is None else temperature
+        )
 
         log_probs = masked_log_softmax(logits, n_slots)
         out: dict[str, torch.Tensor] = {"logits": logits, "log_probs": log_probs}
@@ -484,6 +598,16 @@ class StrandsDeciderModel(nn.Module):
 
     def save_pretrained(self, path: str) -> None:
         os.makedirs(path, exist_ok=True)
+        if self.config.input_mode == "multimodal":
+            if self.processor is None:
+                raise ValueError("multimodal checkpoint needs its processor")
+            from pathlib import Path
+
+            directory = Path(path) / "processor"
+            self.processor.save_pretrained(directory)
+            self.config.processor_files = sorted(
+                str(file.relative_to(path)) for file in directory.rglob("*") if file.is_file()
+            )
         with open(os.path.join(path, CONFIG_NAME), "w", encoding="utf-8") as fh:
             fh.write(self.config.to_json())
         torch.save(self.head.state_dict(), os.path.join(path, "slot_head.pt"))
@@ -501,6 +625,9 @@ class StrandsDeciderModel(nn.Module):
     ) -> StrandsDeciderModel:
         path = checkpoint_dir(path)
         config = StrandsDeciderConfig.from_json(config_path(path))
+        processor = None
+        if config.input_mode == "multimodal":
+            processor = load_vision_processor(path, config)
         # Check the checkpoint's own files before the torso loads its 2B weights. Without
         # this check, a checkpoint without its adapter loads and gives other probabilities.
         lora_dir = os.path.join(path, "lora")
@@ -509,7 +636,7 @@ class StrandsDeciderModel(nn.Module):
                 f"{lora_dir}: missing, but {os.path.basename(config_path(path))} sets use_lora"
             )
         head_state = load_head_state(path)
-        tok = AutoTokenizer.from_pretrained(path)
+        tok = processor.tokenizer if processor is not None else AutoTokenizer.from_pretrained(path)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
 
@@ -526,7 +653,11 @@ class StrandsDeciderModel(nn.Module):
         nn.Module.__init__(obj)
         obj.config = config
         obj.torso = torso
+        if config.input_mode == "multimodal":
+            for parameter in cast(nn.Module, torso.visual).parameters():
+                parameter.requires_grad_(False)
         obj.tokenizer = tok
+        obj.processor = processor
         obj.head = build_head(config, cls.hidden_size(torso))
         obj.head.load_state_dict(head_state)
         obj.head.to(torch.float32)
@@ -582,3 +713,50 @@ def load_head_state(path: str) -> dict[str, torch.Tensor]:
     # weights_only=True is the default from torch 2.6. It is passed explicitly anyway.
     state: dict[str, torch.Tensor] = torch.load(pt, map_location="cpu", weights_only=True)
     return state
+
+
+def load_vision_processor(path: str, config: StrandsDeciderConfig) -> Any:
+    """Validate the declared inventory and independently reconstruct all components."""
+    from pathlib import Path
+
+    from transformers import AutoProcessor
+
+    if not config.processor_files:
+        raise ValueError("multimodal checkpoint is missing its processor file manifest")
+    for name in config.processor_files:
+        if not isinstance(name, str):
+            raise ValueError("invalid processor file manifest")
+        relative = Path(name)
+        if (
+            not relative.parts
+            or relative.is_absolute()
+            or ".." in relative.parts
+            or relative.parts[0] != "processor"
+        ):
+            raise ValueError("invalid processor file manifest")
+        if not (Path(path) / relative).is_file():
+            raise FileNotFoundError(f"missing processor artifact: {name}")
+    try:
+        processor = AutoProcessor.from_pretrained(
+            str(Path(path) / "processor"), local_files_only=True
+        )
+    except (OSError, ValueError, TypeError, ImportError) as exc:
+        raise ValueError(f"cannot reconstruct required vision processor offline: {exc}") from exc
+    required = (
+        "tokenizer",
+        "image_processor",
+        "image_token_id",
+        "image_token",
+        "video_token",
+        "vision_start_token",
+        "vision_end_token",
+    )
+    if any(getattr(processor, name, None) is None for name in required):
+        raise ValueError("vision processor lacks required tokenizer/image components")
+    image_processor = processor.image_processor
+    if any(
+        getattr(image_processor, name, None) is None
+        for name in ("patch_size", "merge_size", "size")
+    ):
+        raise ValueError("vision processor lacks required image processing configuration")
+    return processor
